@@ -1,0 +1,200 @@
+name: 00 (Auto) Pull Request Unit Tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+    branches: [integration]
+    paths:
+      - "**/coreloop/**"
+      - "**/us/**"
+      - "**/de/**"
+      - "**/uk/**"
+
+env:
+  TF_VERSION: 1.0.0
+  TG_VERSION: 0.31.0
+  CI: true
+
+jobs:
+  get-changed-folders:
+    runs-on: ubuntu-latest
+    outputs:
+       changed-folders: ${{ steps.changes.outputs.changed-folders }}
+    steps:
+      - name: Git checkout
+        id: checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Get changed folders
+        id: changes
+        run: |
+          matrix=$((
+            echo '{ "changed-folders" : '
+            echo $(git diff --name-only --diff-filter=ACMRT ${{ github.event.pull_request.base.sha }} ${{ github.sha }} | grep -E '.hcl$|.yaml$|.yml$' | grep -v '^.github' | sed 's|\(.*\)/.*|\1|' | uniq | jq -R -s -c 'split("\n")[:-1]')
+            echo "}"
+          ) | jq -c .)
+          echo "::set-output name=changed-folders::$matrix"
+
+  check_matrix:
+    runs-on: ubuntu-latest
+    needs: get-changed-folders
+    steps:
+      - name: Install json2yaml
+        run: |
+          sudo npm install -g json2yaml
+
+      - name: Check matrix definition
+        run: |
+          matrix='${{ needs.get-changed-folders.outputs.changed-folders }}'
+          echo $matrix
+          echo $matrix | jq .
+          echo $matrix | json2yaml
+          
+  test-changed-folders:
+    runs-on: ubuntu-latest
+    needs: get-changed-folders
+    strategy:
+      fail-fast: false
+      matrix:
+        ${{ fromJSON(needs.get-changed-folders.outputs.changed-folders) }}
+
+    steps:
+      - name: Git checkout
+        id: checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Setup Terragrunt
+        uses: autero1/action-terragrunt@v1.2.0
+        with:
+          terragrunt_version: ${{ env.TG_VERSION }}
+
+      - uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false 
+
+      - name: Setup SSH Keys and known_hosts
+        #  Copied from https://github.com/maddox/actions/blob/master/ssh/entrypoint.sh
+        run: |
+          SSH_PATH="$HOME/.ssh"
+          mkdir -p "$SSH_PATH"
+          touch "$SSH_PATH/known_hosts"
+          echo "${{secrets.ID_RSA}}" > "$SSH_PATH/id_rsa"
+          chmod 700 "$SSH_PATH"
+          ssh-keyscan github.com >> "$SSH_PATH/known_hosts"
+          chmod 600 "$SSH_PATH/known_hosts"
+          chmod 600 "$SSH_PATH/id_rsa"
+          eval $(ssh-agent)
+          ssh-add "$SSH_PATH/id_rsa"
+
+      - name: AWS Credentials
+        id: aws-credentials
+        run: |
+          mkdir -p ~/.aws
+          touch ~/.aws/credentials
+          echo "${{secrets.AWS_CREDENTIALS_FILE}}" > ~/.aws/credentials
+          
+      - name: Terragrunt Format
+        id: fmt
+        working-directory: ${{ matrix.changed-folders }}
+        run: terragrunt hclfmt --terragrunt-check
+        continue-on-error: true
+
+      - name: Terragrunt Init
+        id: init
+        working-directory: ${{ matrix.changed-folders }}
+        run: terragrunt init
+
+      - name: Terragrunt Validate
+        id: validate
+        working-directory: ${{ matrix.changed-folders }}
+        run: |
+          unset t_std t_err
+  
+          eval "$( terragrunt validate -no-color \
+                  2> >(t_err=$(cat); typeset -p t_err) \
+                   > >(t_std=$(cat); typeset -p t_std) )"
+  
+          t_err="${t_err//'%'/'%25'}"
+          t_err="${t_err//$'\n'/'%0A'}"
+          t_err="${t_err//$'\r'/'%0D'}"
+  
+          echo "::set-output name=stderr::$t_err"
+  
+          t_std="${t_std//'%'/'%25'}"
+          t_std="${t_std//$'\n'/'%0A'}"
+          t_std="${t_std//$'\r'/'%0D'}"
+  
+          echo "::set-output name=stdout::$t_std"
+      
+      - name: Terragrunt Plan
+        id: plan
+        working-directory: ${{ matrix.changed-folders }}
+        run: |
+          unset t_std t_err
+    
+          eval "$( terragrunt plan -no-color  \
+                  2> >(t_err=$(cat); typeset -p t_err) \
+                   > >(t_std=$(cat); typeset -p t_std) )"
+    
+          t_err="${t_err//'%'/'%25'}"
+          t_err="${t_err//$'\n'/'%0A'}"
+          t_err="${t_err//$'\r'/'%0D'}"
+          t_err="${t_err//'`'/'"'}"
+    
+          echo "::set-output name=stderr::$t_err"
+    
+          t_std="${t_std//'%'/'%25'}"
+          t_std="${t_std//$'\n'/'%0A'}"
+          t_std="${t_std//$'\r'/'%0D'}"
+          t_std="${t_std//'`'/'"'}"
+    
+          echo "::set-output name=stdout::$t_std"
+        continue-on-error: true
+
+      - name: Update Pull Request
+        uses: actions/github-script@v6
+        env:
+          PLAN: "${{ steps.plan.outputs.stderr }}\n${{ steps.plan.outputs.stdout }}"
+          VALIDATE: "${{ steps.validate.outputs.stderr }}\n${{ steps.validate.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.RELEASE_WORKFLOW_TOKEN }}
+          debug: true
+          script: |
+            const output = `#### Changed Folder: \`${{ matrix.changed-folders }}\`
+            #### Terragrunt Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terragrunt Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terragrunt Validation 🤖
+            
+            <details><summary>Show Validation</summary>
+            
+            \`\`\`${process.env.VALIDATE}
+            \`\`\`
+            
+            </details>
+            
+            #### Terragrunt Plan 📖\`${{ steps.plan.outcome }}\`
+      
+            <details><summary>Show Plan</summary>
+      
+            \`\`\`${process.env.PLAN}
+            \`\`\`
+      
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: Terragrunt Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1

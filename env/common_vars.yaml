@@ -1,0 +1,5 @@
+kms_key_arn: "arn:aws:kms:us-east-1:123456789101:key/81dae5ce-7756-45ce-9e8f-4af481f7a9ab" #Key to use for encrypting RDS and Performance Insights
+hosted_zone_id: "ADING1248AN"
+environment: "env"
+aws_account_id: 123456789101
+aws_region: us-east-1

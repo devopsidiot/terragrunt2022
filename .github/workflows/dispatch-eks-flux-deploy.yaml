@@ -1,0 +1,191 @@
+name: Create or Update EKS/Flux (Dispatch)
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: 'Environment to Deploy to (qa, stg, prd)'
+        required: true
+#      region:
+#        description: 'Region to Deploy to (us-east-1, etc.)'
+#        default: "us-east-1"
+#        required: true
+#     cluster-name:
+#        description: 'Cluster to Deploy to'
+#        default: "cluster-1"
+#        required: true
+    
+env:
+  CI: true
+  TF_VERSION: 1.0.0
+
+jobs:
+  start-runner:
+    name: Start self-hosted EC2 runner
+    runs-on: ubuntu-18.04
+    outputs:
+      label: ${{ steps.start-ec2-runner.outputs.label }}
+      ec2-instance-id: ${{ steps.start-ec2-runner.outputs.ec2-instance-id }}
+    steps:
+      - name: Git checkout
+        id: checkout
+        uses: actions/checkout@v2
+
+      - name: Setup Terragrunt
+        uses: autero1/action-terragrunt@v1.1.0
+        with:
+          terragrunt_version: 0.31.0 
+
+      - uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false 
+
+      - name: AWS Credentials
+        id: aws-credentials
+        run: |
+          mkdir -p ~/.aws
+          touch ~/.aws/credentials
+          echo "${{secrets.AWS_CREDENTIALS_FILE}}" > ~/.aws/credentials
+          echo "AWS_PROFILE=${{ github.event.inputs.env }}" >> $GITHUB_ENV
+          echo "AWS_REGION=us-east-1" >> $GITHUB_ENV
+
+      - name: Setup SSH Keys and known_hosts
+        #  Copied from https://github.com/maddox/actions/blob/master/ssh/entrypoint.sh
+        run: |
+          SSH_PATH="$HOME/.ssh"
+          mkdir -p "$SSH_PATH"
+          touch "$SSH_PATH/known_hosts"
+          echo "${{secrets.ID_RSA}}" > "$SSH_PATH/id_rsa"
+          chmod 700 "$SSH_PATH"
+          ssh-keyscan github.com >> "$SSH_PATH/known_hosts"
+          chmod 600 "$SSH_PATH/known_hosts"
+          chmod 600 "$SSH_PATH/id_rsa"
+          eval $(ssh-agent)
+          ssh-add "$SSH_PATH/id_rsa"
+
+      - name: Pull from terraform state
+        id: tf-state-pull
+        run: |
+          cd ${{github.event.inputs.env}}/vpc
+          terragrunt init --terragrunt-non-interactive
+          echo "SG_ID=$(terragrunt output default_sg_id --terragrunt-non-interactive | tr -d '"')" >> ${GITHUB_ENV}
+          echo "PRIV_SUBNET=$(terragrunt output -json private_subnets | jq '.[0]' | tr -d '"')" >> ${GITHUB_ENV}
+          echo "AMI_ID=$(aws ssm get-parameters --names /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2 | jq '.Parameters[0].Value' | tr -d '"')" >> ${GITHUB_ENV}
+
+      # This commit SHA maps to machulav/ec2-github-runner@v2.2.0
+      - name: Start ec2 instance
+        id: start-ec2-runner
+        uses: machulav/ec2-github-runner@700df615af4c7cabc37fb1e42c4797f2a1299c2e
+        with:
+          mode: start
+          github-token: ${{ secrets.RELEASE_WORKFLOW_TOKEN }}
+          ec2-image-id: ${{ env.AMI_ID }}
+          ec2-instance-type: m5.large
+          subnet-id: ${{ env.PRIV_SUBNET }}
+          security-group-id: ${{ env.SG_ID }}
+          aws-resource-tags: > # optional, requires additional permissions
+            [
+              {"Key": "Name", "Value": "ec2-github-runner"},
+              {"Key": "GitHubRepository", "Value": "${{ github.repository }}"}
+            ]
+
+  create-update-eks-flux:
+    name: Create or Update EKS and Flux
+    needs: start-runner # required to start the main job when the runner is ready
+    runs-on: ${{ needs.start-runner.outputs.label }} # run the job on the newly created runner
+    env:
+      HOME: /root
+    steps:
+      - name: Update Git and Install Terraform
+        id: update-git-terraform
+        run: |
+          sudo yum -y install git curl
+          sudo yum-config-manager --add-repo https://rpm.releases.hashicorp.com/AmazonLinux/hashicorp.repo
+          sudo yum -y install terraform-${TF_VERSION}-1.x86_64
+
+      - name: Git checkout
+        id: checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_WORKFLOW_TOKEN }}
+
+      - name: Setup Terragrunt
+        uses: autero1/action-terragrunt@v1.1.0
+        with:
+          terragrunt_version: 0.31.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v2-beta
+        with:
+          node-version: 16
+
+      - name: AWS Credentials
+        id: aws-credentials
+        run: |
+          mkdir -p ~/.aws
+          touch ~/.aws/credentials
+          echo "${{secrets.AWS_CREDENTIALS_FILE}}" > ~/.aws/credentials
+      
+      - name: Set up AWS authenticator
+        id: aws-authenticator
+        run: |
+          curl -o aws-iam-authenticator https://amazon-eks.s3.us-west-2.amazonaws.com/1.19.6/2021-01-05/bin/linux/amd64/aws-iam-authenticator
+          chmod +x ./aws-iam-authenticator
+          mv ./aws-iam-authenticator /usr/local/bin
+
+      - name: Setup SSH Keys and known_hosts
+        #  Copied from https://github.com/maddox/actions/blob/master/ssh/entrypoint.sh
+        run: |
+          SSH_PATH="$HOME/.ssh"
+          mkdir -p "$SSH_PATH"
+          touch "$SSH_PATH/known_hosts"
+          echo "${{secrets.ID_RSA}}" > "$SSH_PATH/id_rsa"
+          chmod 700 "$SSH_PATH"
+          ssh-keyscan github.com >> "$SSH_PATH/known_hosts"
+          chmod 600 "$SSH_PATH/known_hosts"
+          chmod 600 "$SSH_PATH/id_rsa"
+          eval $(ssh-agent)
+          ssh-add "$SSH_PATH/id_rsa"
+    
+      - name: Create or Update EKS
+        id: create-or-update-eks
+        run: |
+          cd ${{github.event.inputs.env}}/eks
+          terragrunt init --terragrunt-non-interactive
+          terragrunt plan --terragrunt-non-interactive
+          terragrunt apply -auto-approve --terragrunt-non-interactive
+      
+      - name: Create or Update Flux
+        id: create-or-update-flux
+        run: |
+          cd ${{github.event.inputs.env}}/flux
+          terragrunt init --terragrunt-non-interactive
+          terragrunt plan --terragrunt-non-interactive
+          terragrunt apply -auto-approve --terragrunt-non-interactive
+
+  stop-runner:
+    name: Stop self-hosted EC2 runner
+    needs:
+      - start-runner # required to get output from the start-runner job
+      - create-update-eks-flux # required to wait when the main job is done
+    runs-on: ubuntu-latest
+    if: ${{ always() }} # required to stop the runner even if the error happened in the previous jobs
+    steps:
+      - name: AWS Credentials
+        id: aws-credentials
+        run: |
+          mkdir -p ~/.aws
+          touch ~/.aws/credentials
+          echo "${{secrets.AWS_CREDENTIALS_FILE}}" > ~/.aws/credentials
+          echo "AWS_PROFILE=${{ github.event.inputs.env }}" >> $GITHUB_ENV
+          echo "AWS_REGION=us-east-1" >> $GITHUB_ENV
+
+      # This commit SHA maps to machulav/ec2-github-runner@v2.2.0
+      - name: Stop EC2 runner
+        uses: machulav/ec2-github-runner@700df615af4c7cabc37fb1e42c4797f2a1299c2e
+        with:
+          mode: stop
+          github-token: ${{ secrets.RELEASE_WORKFLOW_TOKEN }}
+          label: ${{ needs.start-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.start-runner.outputs.ec2-instance-id }}
